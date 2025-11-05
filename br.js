@@ -20,14 +20,14 @@ const JWT_SECRET = process.env.JWT_SECRET || 'please_change_this_secret';
 const BATCH_INTERVAL_MS = 10000; // ১০ সেকেন্ড পর পর ডাটাবেসে সেভ হবে
 const FILTER_INTERVAL_MS = 10 * 60 * 1000; // ১০ মিনিট
 
-// --- নতুন সংযোজন: অফলাইন চেকের জন্য ভেরিয়েবল ---
-const OFFLINE_THRESHOLD_MS = 10 * 60 * 1000; // ১০ মিনিট (অফলাইন হওয়ার সময়)
-const CHECK_OFFLINE_INTERVAL_MS = 1 * 60 * 1000; // প্রতি ১ মিনিটে চেক করবে
-// --- শেষ সংযোজন ---
-
 let espDataBuffer = []; // ESP32 থেকে আসা ডেটা এখানে জমা হবে
 const backupJobs = new Map(); // jobId -> { status, progress, tmpDir, zipPath, error }
+// ...
+//const FILTER_INTERVAL_MS = 10 * 60 * 1000; // ১০ মিনিট
 
+// --- নতুন যোগ করুন ---
+const OFFLINE_THRESHOLD_MS = 10 * 60 * 1000; // ১০ মিনিট (অফলাইন হওয়ার সময়)
+const CHECK_OFFLINE_INTERVAL_MS = 1 * 60 * 1000; // প্রতি ১ মিনিটে চেক করবে
 // --- অ্যাপ এবং সার্ভার সেটআপ ---
 const app = express();
 const port = process.env.PORT || 3002;
@@ -92,12 +92,6 @@ async function flushDataBuffer(collection, devicesCollection) {
     // ১. মূল ডেটা EspCollection-এ ইনসার্ট করা
     await collection.insertMany(dataToInsert, { ordered: false });
     console.log(`[Batch Insert] Successfully inserted ${dataToInsert.length} documents.`);
-    
-    // --- [Socket.io ব্রডকাস্ট] ---
-    // নতুন ডেটা ক্লায়েন্টদের কাছে পাঠানো
-    // দ্রষ্টব্য: যদি ডেটা খুব বেশি হয় (যেমন >১০০০), তাহলে একটি সারাংশ (summary) পাঠানো ভালো
-    io.emit('new-data', dataToInsert);
-    // --- ব্রডকাস্ট শেষ ---
 
     // --- [ফাস্ট সিঙ্ক] রিয়েল-টাইম ডিভাইস স্ট্যাটাস আপডেট ---
     const lastSeenUpdates = new Map();
@@ -238,44 +232,6 @@ async function run() {
     // db.devices.createIndex({ uid: 1 }, { unique: true })
     // db.users.createIndex({ email: 1 }, { unique: true })
 
-
-    // --- [নতুন ফাংশন] অফলাইন চেকার ---
-    /**
-     * [অফলাইন চেকার]
-     * যে ডিভাইসগুলো 'online' স্ট্যাটাসে আছে কিন্তু
-     * OFFLINE_THRESHOLD_MS (১০ মিনিট) ধরে কোনো ডেটা পাঠায়নি,
-     * সেগুলোকে 'offline' সেট করে।
-     */
-    async function checkOfflineDevices() {
-      console.log('[Offline Check] Running job to find offline devices...');
-      try {
-        // ১০ মিনিট আগের সময়
-        const thresholdTime = new Date(Date.now() - OFFLINE_THRESHOLD_MS);
-        
-        // সেই সব ডিভাইস খুঁজুন যারা 'online' কিন্তু 'lastSeen' ১০ মিনিটের বেশি পুরনো
-        const result = await devicesCollection.updateMany(
-          { 
-            status: 'online', 
-            lastSeen: { $lt: thresholdTime } // lastSeen < (বর্তমান সময় - ১০ মিনিট)
-          },
-          { 
-            $set: { status: 'offline' } 
-          }
-        );
-
-        if (result.modifiedCount > 0) {
-          console.log(`[Offline Check] Marked ${result.modifiedCount} devices as offline.`);
-          // একটি সকেট ইভেন্ট পাঠানো যেতে পারে অ্যাডমিন ড্যাশবোর্ড আপডেটের জন্য
-          io.emit('device-status-updated', { offlineCount: result.modifiedCount });
-        }
-        // যদি 0 হয়, তার মানে সব অনলাইন ডিভাইস ঠিকঠাক ডেটা পাঠাচ্ছে।
-      } catch (error) {
-        console.error('[Offline Check] Error checking for offline devices:', error.message);
-      }
-    }
-    // --- অফলাইন চেকার ফাংশন শেষ ---
-
-
     // --- টাইমার চালু করা ---
     
     // [ফাস্ট সিঙ্ক] প্রতি ১০ সেকেন্ড পর পর বাফার খালি করা
@@ -287,19 +243,9 @@ async function run() {
     // প্রতি ১৫ মিনিটে পুরনো ব্যাকআপ জব মুছে ফেলা
     setInterval(cleanupOldBackupJobs, 15 * 60 * 1000);
 
-    // --- [নতুন টাইমার] ---
-    // [অফলাইন চেকার] প্রতি ১ মিনিটে অফলাইন ডিভাইস চেক করা
-    setInterval(() => checkOfflineDevices(), CHECK_OFFLINE_INTERVAL_MS);
-    // --- নতুন টাইমার শেষ ---
-
     // সার্ভার চালু হলেই একবার 'স্লো সিঙ্ক' চালানোর জন্য
     console.log('Running initial device list sync job on startup...');
     syncAllDevices(EspCollection, devicesCollection);
-    
-    // সার্ভার চালু হলেই একবার 'অফলাইন চেক' চালানোর জন্য
-    console.log('Running initial offline device check on startup...');
-    checkOfflineDevices();
-
 
     // --- অ্যাডমিন চেক হেল্পার (run-এর ভেতরে) ---
     async function ensureAdmin(req, res) {
@@ -366,7 +312,7 @@ async function run() {
     // --- Public Data Routes ---
 
     // GET /api/device/data
-    // সর্বশেষ N (default 300) ডেটা পয়েন্ট
+    // সর্বশেষ N (default 300) ডেটা পয়েন্ট
     app.get('/api/device/data', async (req, res) => {
       try {
         const { uid, limit } = req.query || {};
@@ -388,7 +334,7 @@ async function run() {
     });
 
     // POST /api/device/data-by-range
-    // তারিখ অনুযায়ী ডেটা
+    // তারিখ অনুযায়ী ডেটা
     app.post('/api/device/data-by-range', async (req, res) => {
       try {
         const { uid, start, end, limit } = req.body || {};
@@ -720,7 +666,7 @@ async function run() {
     // --- Admin-Protected Routes ---
 
     // POST /api/filter/device (অ্যাডমিন রুট)
-    // ম্যানুয়ালি ১০-মিনিটের "স্লো সিঙ্ক" জবটি ট্রিগার করার জন্য
+    // ম্যানুয়ালি ১০-মিনিটের "স্লো সিঙ্ক" জবটি ট্রিগার করার জন্য
     app.post('/api/filter/device', authenticateJWT, async (req, res) => {
       const check = await ensureAdmin(req, res);
       if (!check || check.ok !== true) return; // অ্যাডমিন কিনা চেক করা
